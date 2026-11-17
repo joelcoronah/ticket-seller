@@ -1,0 +1,19 @@
+# Dev overlay: publishes ports to localhost and enables the load-test reset endpoint.
+# In production Dokploy's Traefik plays the role of `lb`.
+services:
+  lb:
+    image: nginx:1.27-alpine
+    ports: ["3000:80"]
+    volumes: ["./deploy/nginx.dev.conf:/etc/nginx/nginx.conf:ro"]
+    sysctls:
+      net.core.somaxconn: 8192
+    depends_on: [api]
+  api:
+    environment:
+      ALLOW_RESET: "true"
+  redis:
+    ports: ["6379:6379"]
+  redpanda:
+    ports: ["19092:19092"]
+  postgres:
+    ports: ["5432:5432"]

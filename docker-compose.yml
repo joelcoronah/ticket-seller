@@ -1,0 +1,93 @@
+# Production-shaped stack (used by Dokploy). No infra ports are published:
+# only `api` is reachable, through Dokploy's Traefik (domain configured in the UI).
+# Local dev: docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d --build
+
+x-backend: &backend
+  build: ./backend
+  image: flashsale-backend:latest
+  restart: unless-stopped
+  environment:
+    REDIS_URL: redis://redis:6379
+    KAFKA_BROKERS: redpanda:9092
+    DATABASE_URL: postgres://${POSTGRES_USER:-flashsale}:${POSTGRES_PASSWORD:-flashsale}@postgres:5432/${POSTGRES_DB:-flashsale}
+    ADMIN_TOKEN: ${ADMIN_TOKEN:-dev-admin-token}
+    ALLOW_RESET: ${ALLOW_RESET:-false}
+    HOLD_TTL_MS: ${HOLD_TTL_MS:-300000}
+    CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:5173}
+  depends_on:
+    redis: { condition: service_healthy }
+    redpanda: { condition: service_healthy }
+    postgres: { condition: service_healthy }
+
+services:
+  api:
+    <<: *backend
+    command: ["node", "dist/main.js"]
+    expose: ["3000"]
+    # Stateless: any replica can serve any request or SSE stream (results arrive
+    # via Redis pub/sub on every instance). Traefik balances across replicas.
+    deploy:
+      replicas: ${API_REPLICAS:-3}
+    sysctls:
+      net.core.somaxconn: 8192
+
+  worker:
+    <<: *backend
+    command: ["node", "dist/worker.js"]
+    healthcheck: { disable: true }
+    deploy:
+      replicas: ${WORKER_REPLICAS:-2}
+
+  redis:
+    image: redis:7.4-alpine
+    restart: unless-stopped
+    # noeviction: Redis must NEVER evict inventory keys under memory pressure.
+    # AOF everysec: at most ~1 s of state lost on crash (rebuildable from PG via open-sale).
+    command: >
+      redis-server --appendonly yes --appendfsync everysec
+      --maxmemory 512mb --maxmemory-policy noeviction
+    volumes: [redis-data:/data]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  redpanda:
+    # Kafka-API compatible, single binary, no ZooKeeper/KRaft tuning: ideal for one VPS.
+    image: docker.redpanda.com/redpandadata/redpanda:v24.2.7
+    restart: unless-stopped
+    command:
+      - redpanda start
+      - --mode dev-container
+      - --smp 1
+      - --memory 1G
+      - --kafka-addr internal://0.0.0.0:9092,external://0.0.0.0:19092
+      - --advertise-kafka-addr internal://redpanda:9092,external://localhost:19092
+    volumes: [redpanda-data:/var/lib/redpanda/data]
+    healthcheck:
+      test: ["CMD-SHELL", "rpk cluster health | grep -E 'Healthy:.+true' || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-flashsale}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-flashsale}
+      POSTGRES_DB: ${POSTGRES_DB:-flashsale}
+    volumes:
+      - pg-data:/var/lib/postgresql/data
+      - ./db/migrations:/docker-entrypoint-initdb.d:ro # runs only on first boot
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  redis-data:
+  redpanda-data:
+  pg-data:
